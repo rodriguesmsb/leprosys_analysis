@@ -1,0 +1,431 @@
+---
+title: "VIz"
+output: html_document
+date: "2023-02-10"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+rm(list=ls())
+packages_list <-  c("tidyverse", "INLA", "lubridate", "SpatialEpi","rgdal", "sf", "spdep")
+lapply(packages_list, require, character.only = TRUE)
+```
+
+
+```{r}
+data <- read_csv("../data/2023_02_10_Data_to_analyze.csv")
+ineq <- read_csv("../data/2023_04_18_Inequalities.csv")
+pop <- read_csv("../data/pop.csv")
+brazil <- readOGR(dsn = "~/Dados/SHAPEFILES/Brasil/states/", layer = "UFEBRASIL")
+```
+
+
+```{r}
+data <- data %>% 
+  filter(year >= 2015)
+#add info to data
+ineq <- ineq %>% 
+  rename(id_mn_resi = id) %>% 
+  mutate(id_mn_resi = as.numeric(substr(as.character(id_mn_resi), start = 1, stop = 6)),
+         ubs_p_100_h = as.numeric(str_replace(ubs_p_100_h, pattern = ",", replacement = ".")))
+
+pop <- pop %>% 
+  rename(id_mn_resi = cod) %>% 
+  mutate(id_mn_resi = as.numeric(substr(as.character(id_mn_resi), start = 1, stop = 6)))
+
+data <- data %>% 
+  left_join(ineq, by = c("id_mn_resi", "year")) %>% 
+  left_join(pop, by = c("id_mn_resi", "year"))
+```
+
+
+```{r}
+#group by mesoregion
+data <- data %>% 
+  mutate(CD_GEOCODU = substr(as.character(id_mn_resi), start = 1, stop = 2))
+
+data <- data %>% 
+  group_by(year, CD_GEOCODU) %>% 
+  summarise(pop = sum(pop, na.rm = TRUE),
+            cases = sum(cases, na.rm = TRUE),
+            cob_bf = mean(cob_bf, na.rm = TRUE),
+            p_ab_lp = mean(p_ab_lp, na.rm = TRUE),
+            ubs_p_100_h = mean(ubs_p_100_h, na.rm = TRUE))
+```
+
+
+```{r}
+#create variables to run Inla model
+data <- data %>% 
+  mutate(time_str = year - 2014,
+         time_non_str = year - 2014,
+         E = expected(pop, cases, 1),
+         incidence = cases/pop*100000,
+         area_str = as.numeric(as.factor(CD_GEOCODU)),
+         area_non_str = as.numeric(as.factor(CD_GEOCODU))) %>% 
+  filter(year <= 2021) %>% 
+  mutate(SIR = cases/E)
+```
+
+
+```{r}
+brazil <-  st_as_sf(brazil)
+data <- data %>% 
+  left_join(brazil)
+```
+
+
+```{r}
+ggplot(data) + geom_sf(aes(geometry = geometry, fill = SIR)) +
+  facet_wrap(~year, dir = "h", ncol = 3) +
+  ggtitle("SIR") + theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red"
+  ) +
+  theme_bw(base_size = 32)
+ggsave("../results/SIR_maps.pdf", device = "pdf", width = 35, height = 30, dpi = 300)
+```
+
+
+```{r}
+#create neig matrix
+sf_use_s2(FALSE)
+nb <- poly2nb(brazil)
+nb2INLA("../data/map.adj", nb)
+g <- inla.read.graph(filename = "../data/map.adj")
+plot(g)
+```
+
+
+```{r}
+inla_model <- cases ~ cob_bf + p_ab_lp + ubs_p_100_h +
+     
+      #omega structured time effect
+      f(time_str, model = "rw1", 
+        hyper = list("prec" = list(prior = "loggamma", param = c(0.1, 0.00001)))) +
+      
+      #phi non srtuctured time effect
+      f(time_non_str, model = "iid", 
+        hyper = list("prec" = list(prior = "loggamma", param = c(0.1, 0.00001)))) +
+      
+      #non structured effect
+      f(area_non_str, model = "iid", 
+        hyper = list("prec" = list(prior = "loggamma", param = c(0.1, 0.00001)))) +
+  
+  
+     #car (effect of structured area)
+     f(area_str, model = "besag", graph = g,
+       hyper = list("prec" = list(prior = "loggamma", param = c(0.1, 0.00001))))
+
+
+inla_result <- inla(inla_model,
+                    E = E,
+                    family = "poisson",
+                    data = data,
+                    
+                    # Fixed effect priors: beta0, beta1,...,beta3
+                    control.fixed = control.fixed(mean.intercept = 0, prec.intercept = 0.0001,
+                                                  mean = 0, prec = 0.0001),
+                    control.predictor = list(compute = TRUE, link = 1, cdf = c(log(1))),
+                    control.compute = list(dic = TRUE, cpo = TRUE, return.marginals.predictor=TRUE))
+```
+
+
+```{r}
+data <- data %>% 
+      add_column(rr = inla_result$summary.fitted.values[, "mean"],
+                 lb = inla_result$summary.fitted.values[, "0.025quant"],
+                 ub = inla_result$summary.fitted.values[, "0.975quant"])
+
+data <-  data %>% 
+  add_column(ppd = 1 - inla_result$summary.fitted.values[,"1 cdf"])
+
+
+#compute excess probability
+
+pe <- list()
+for(i in 1:189){
+  pe[i] <- 1 - inla.pmarginal(q = 1, marginal = inla_result$marginals.fitted.values[[i]])
+}
+
+
+data <- data %>% 
+  add_column(pe = unlist(pe))
+```
+
+
+```{r}
+ggplot(data) + geom_sf(aes(geometry = geometry, fill = rr)) +
+  facet_wrap(~year, dir = "h", ncol = 3) +
+  ggtitle("RR") + theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  scale_fill_gradient2(
+    midpoint = 1, low = "blue", mid = "white", high = "red"
+  ) +
+  theme_bw(base_size = 32)
+ggsave("../results/RR_maps.pdf", device = "pdf", width = 35, height = 30, dpi = 300)
+```
+
+
+```{r}
+ggplot(data) + geom_sf(aes(geometry = geometry, fill = pe)) +
+  facet_wrap(~year, dir = "h", ncol = 3) +
+  ggtitle("PE") + theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  scale_fill_gradient2(
+    midpoint = 0.5, low = "blue", mid = "white", high = "red"
+  ) +
+  theme_bw(base_size = 32)
+ggsave("../results/PE_maps.pdf", device = "pdf", width = 35, height = 30, dpi = 300)
+```
+
+
+
+```{r}
+exp(inla_result$summary.fixed)
+```
+
+
+```{r}
+data %>% 
+  group_by(CD_GEOCODU) %>% 
+  summarise(rr = mean(rr),
+            lb = mean(lb),
+            up = mean(ub)) %>% 
+  arrange(rr) %>% 
+  print(n = 27)
+
+```
+
+
+
+```{r}
+#temporal pattern
+temp_pattern <- data %>% 
+  group_by(year) %>% 
+  summarise(cases = sum(cases, na.rm = TRUE),
+            pop = sum(pop, na.rm = TRUE)) %>% 
+  mutate(incidence = cases/pop * 100000)
+
+
+ggplot(temp_pattern,aes(x = year, y = incidence )) +
+  geom_bar(stat = "identity") +
+  theme_bw(base_size = 48) +
+  labs(x = NULL, y = "Leprosy incidence")
+```
+
+
+```{r}
+desc_spatial <- data %>% 
+  group_by(CD_GEOCODU) %>% 
+  summarise(ibp_per_state = max(mean_ibp),
+            gini_per_state = max(mean_gini),
+            idhm_per_state = max(mean_idhm),
+            incidence = mean(incidence, na.rm = TRUE),
+            mortality = mean(mortality, na.rm = TRUE))
+
+
+brazil <- read_sf(dsn = "~/Dados/SHAPEFILES/Brasil/UFEBRASIL.shp")
+
+
+brazil <- brazil %>% 
+      left_join(desc_spatial)
+
+
+
+ggplot() +
+      geom_sf(data = brazil, aes(fill = incidence)) +
+      scale_fill_gradientn(colours = hcl.colors(5, "YlOrRd",
+                                            rev = TRUE,
+                                            alpha = 0.9),
+                            breaks = c(1, 2.5, 5.0, 7.5)) +
+      guides(fill = guide_legend(title = "")) +
+      labs(title = "",
+           size = "") +
+      theme_void(base_size = 48) +
+      theme(legend.position = "bottom") +
+      ggsave("../results/Fig_2A_Incidence.pdf", device = "pdf", width = 20, height = 18)
+
+
+ggplot() +
+      geom_sf(data = brazil, aes(fill = mortality)) +
+      scale_fill_gradientn(colours = hcl.colors(5, "Reds 3",
+                                            rev = TRUE,
+                                            alpha = 0.9),
+                           breaks = c(0.01, 0.03, 0.06, 0.09)) +
+      guides(fill = guide_legend(title = "")) +
+      labs(title = "",
+           size = "") +
+      theme_void(base_size = 48) +
+      theme(legend.position = "bottom") +
+      ggsave("../results/Fig_2B_Mortality.pdf", device = "pdf", width = 20, height = 18)
+
+
+
+ggplot() +
+      geom_sf(data = brazil, aes(fill = ibp_per_state)) +
+      scale_fill_gradientn(colours = hcl.colors(5, "YlOrBr",
+                                            rev = TRUE,
+                                            alpha = 0.9)
+                           ) +
+      guides(fill = guide_legend(title = "")) +
+      labs(title = "",
+           size = "") +
+      theme_void(base_size = 48) +
+      theme(legend.position = "bottom") +
+      ggsave("../results/Fig_2C_IBP.pdf", device = "pdf", width = 20, height = 18)
+
+ggplot() +
+      geom_sf(data = brazil, aes(fill = gini_per_state)) +
+      scale_fill_gradientn(colours = hcl.colors(5, "Grays",
+                                            rev = TRUE,
+                                            alpha = 0.9)
+                           ) +
+      guides(fill = guide_legend(title = "")) +
+      labs(title = "",
+           size = "") +
+      theme_void(base_size = 48) +
+      theme(legend.position = "bottom") +
+      ggsave("../results/Fig_2D_GINI.pdf", device = "pdf", width = 20, height = 18)
+
+
+ggplot() +
+      geom_sf(data = brazil, aes(fill = gini_per_state)) +
+      scale_fill_gradientn(colours = hcl.colors(5, "PuRd",
+                                            rev = TRUE,
+                                            alpha = 0.9)
+                           ) +
+      guides(fill = guide_legend(title = "")) +
+      labs(title = "",
+           size = "") +
+      theme_void(base_size = 48) +
+      theme(legend.position = "bottom") +
+      ggsave("../results/Fig_2E_IDHM.pdf", device = "pdf", width = 20, height = 18)
+```
+
+
+```{r}
+inla_data <- data %>% 
+  group_by(year,CD_GEOCODU) %>% 
+  summarise(cases = sum(cases),
+            death = sum(death),
+            pop = max(pop),
+            mean_ibp = max(mean_ibp),
+            mean_idhm = max(mean_idhm),
+            mean_gini = max(mean_gini))
+  
+inla_data <-  inla_data %>% 
+  mutate(time_str = year - 2009,
+         time_non_str = year - 2009,
+         id_str = as.numeric(as.factor(CD_GEOCODU)),
+         id_non_str = as.numeric(as.factor(CD_GEOCODU)),
+         E = expected(pop,cases,n.strata = 1))
+```
+
+
+```{r}
+inla_data <- inla_data %>% 
+  na.omit()
+
+
+```
+
+
+```{r}
+inla_result <- inla(inla_model,
+                    E = E,
+                    family = "poisson",
+                    data = inla_data,
+                    
+                    # Fixed effect priors: beta0, beta1,...,beta3
+                    control.fixed = control.fixed(mean.intercept = 0, prec.intercept = 0.0001,
+                                                  mean = 0, prec = 0.0001),
+                    control.predictor = list(compute = TRUE, link = 1, cdf = c(log(1))),
+                    control.compute = list(dic = TRUE, cpo = TRUE))
+```
+
+
+
+
+
+
+```{r}
+point_estimate <- lapply(inla_result$marginals.random$time_str,function(X){
+    marg <- inla.tmarginal(function(x) exp(x), X)
+    inla.emarginal(mean, marg)})
+
+point_estimate_ns <- lapply(inla_result$marginals.random$time_non_str,function(X){
+    marg <- inla.tmarginal(function(x) exp(x), X)
+    inla.emarginal(mean, marg)})
+
+lower_bond <- lapply(inla_result$marginals.random$time_str,function(X){
+    marg <- inla.tmarginal(function(x) exp(x), X)
+    inla.hpdmarginal(0.95, marg)[1]})
+  
+upper_bond <- lapply(inla_result$marginals.random$time_str,function(X){
+    marg <- inla.tmarginal(function(x) exp(x), X)
+    inla.hpdmarginal(0.95, marg)[2]})
+
+temporal_df <- data.frame(Time = 2012:2021,
+                    Estimated = round(unlist(point_estimate),3),
+                    NS = round(unlist(point_estimate_ns),3),
+                    LB = round(unlist(lower_bond),3),
+                    UB = round(unlist(upper_bond),3))
+
+
+ggplot(temporal_df, aes(x = Time)) +
+  geom_line(aes(y = Estimated), lwd = 2) +
+  geom_hline(yintercept = 1, lwd = 2, lty = 2, col = "red") +
+  theme_bw(base_size = 48) +
+  labs(x = NULL, y = "Leprosy temporal relative risk") +
+  ggsave("../results/Fig_3A_RR_time.pdf", device = "pdf", width = 20, height = 18)
+```
+
+
+```{r}
+spatial_inla <- inla_data %>% 
+  group_by(CD_GEOCODU) %>% 
+  summarise(rr = mean(rr),
+            ppd = mean(ppd))
+
+
+brazil <- brazil %>% 
+      left_join(spatial_inla)
+
+
+ggplot() +
+      geom_sf(data = brazil, aes(fill = rr)) +
+      scale_fill_gradient2(midpoint = 1, low="blue", mid="white",
+                     high="red", space ="Lab",
+                     breaks = c(0.5, 1, 2, 4, 6)) +
+      guides(fill = guide_legend(title = "")) +
+      labs(title = "",
+           size = "") +
+      theme_void(base_size = 48) +
+      theme(legend.position = "bottom") +
+      ggsave("../results/Fig_3B_Spatial_RR.pdf", device = "pdf", width = 20, height = 18)
+
+
+```
+
+
+
+
+
+
+
+
